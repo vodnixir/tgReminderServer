@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(python --version; python -m py_compile main.py config.py db.py commands.py scheduler.py; echo \"compile ok: $?\")"
+    ]
+  }
+}

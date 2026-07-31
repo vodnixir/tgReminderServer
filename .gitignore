@@ -1,0 +1,9 @@
+# Секреты и данные — никогда не коммитить
+.env
+*.session
+*.session-journal
+reminders.db
+
+__pycache__/
+venv/
+.venv/

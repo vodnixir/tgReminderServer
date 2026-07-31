@@ -1,0 +1,23 @@
+# Установка на Raspberry Pi:
+#   sudo cp deploy/tgreminder.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now tgreminder
+# Логи: journalctl -u tgreminder -f
+#
+# Замените пути и User, если проект лежит не в /home/pi/tgproj.
+
+[Unit]
+Description=Telegram reminder userbot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/tgproj
+ExecStart=/home/pi/tgproj/venv/bin/python main.py
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
