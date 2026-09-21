@@ -9,6 +9,25 @@ from ai import GroqInterpreter, validate_action
 
 
 class AiTests(unittest.IsolatedAsyncioTestCase):
+    async def test_recipient_reply_interpretation_is_limited_to_confirmation(self):
+        class Fake(GroqInterpreter):
+            def _request(self, payload):
+                self.payload = payload
+                return {"choices": [{"message": {"content": json.dumps({
+                    "action": "snooze", "reminder_id": 7, "when": None,
+                    "text": None, "target": None, "weekdays": [],
+                    "interval_seconds": None, "repeats": None,
+                    "duration_seconds": 180, "limit": None, "reason": "",
+                    "confirmation_required": None,
+                })}}]}
+
+        interpreter = Fake("example-key")
+        action = await interpreter.interpret_response(
+            "через три минутки ещё раз", datetime(2026, 9, 21, 12),
+            {"reminder_id": 7, "text": "Вода", "target": "@ivan"})
+        self.assertEqual(action["duration_seconds"], 180)
+        self.assertIn("Вода", interpreter.payload["messages"][1]["content"])
+
     def test_request_uses_official_groq_client(self):
         class FakeCompletions:
             def create(self, **kwargs):

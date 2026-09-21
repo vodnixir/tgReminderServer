@@ -9,6 +9,7 @@ import sqlite3
 from datetime import datetime, timedelta
 
 DATETIME_FMT = "%Y-%m-%d %H:%M:%S"
+CONFIRM_RETRY_SECONDS = 600
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS reminders (
@@ -22,7 +23,8 @@ CREATE TABLE IF NOT EXISTS reminders (
     scheduled_msg_id INTEGER,
     weekdays TEXT,
     weekly_time TEXT,
-    paused INTEGER NOT NULL DEFAULT 0
+    paused INTEGER NOT NULL DEFAULT 0,
+    confirmation_required INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS notices (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -38,10 +40,24 @@ CREATE TABLE IF NOT EXISTS history (
     status TEXT NOT NULL,
     detail TEXT,
     message_id INTEGER,
-    source_id INTEGER
+    source_id INTEGER,
+    chat_id INTEGER,
+    pending_id INTEGER,
+    confirmation_requested INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS history_message_idx ON history(message_id);
 CREATE INDEX IF NOT EXISTS history_reminder_idx ON history(reminder_id, id);
+CREATE TABLE IF NOT EXISTS pending_confirmations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    reminder_id INTEGER NOT NULL UNIQUE,
+    target TEXT NOT NULL,
+    text TEXT NOT NULL,
+    chat_id INTEGER NOT NULL,
+    next_retry TEXT NOT NULL,
+    retry_seconds INTEGER NOT NULL DEFAULT 600,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS pending_next_retry_idx ON pending_confirmations(next_retry);
 """
 
 
@@ -74,13 +90,25 @@ def _migrate(conn):
         conn.execute("ALTER TABLE reminders ADD COLUMN weekly_time TEXT")
     if "paused" not in cols:
         conn.execute("ALTER TABLE reminders ADD COLUMN paused INTEGER NOT NULL DEFAULT 0")
+    if "confirmation_required" not in cols:
+        conn.execute("ALTER TABLE reminders ADD COLUMN confirmation_required INTEGER NOT NULL DEFAULT 0")
+    history_cols = [r["name"] for r in conn.execute("PRAGMA table_info(history)")]
+    if "chat_id" not in history_cols:
+        conn.execute("ALTER TABLE history ADD COLUMN chat_id INTEGER")
+    if "pending_id" not in history_cols:
+        conn.execute("ALTER TABLE history ADD COLUMN pending_id INTEGER")
+    if "confirmation_requested" not in history_cols:
+        conn.execute(
+            "ALTER TABLE history ADD COLUMN confirmation_requested INTEGER NOT NULL DEFAULT 0"
+        )
 
 
-def add_reminder(conn, target, text, next_run, interval_seconds, repeats, weekdays=None):
+def add_reminder(conn, target, text, next_run, interval_seconds, repeats, weekdays=None,
+                 confirmation_required=False):
     cur = conn.execute(
         "INSERT INTO reminders"
-        " (target, text, next_run, interval_seconds, repeats_left, created_at, weekdays, weekly_time)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        " (target, text, next_run, interval_seconds, repeats_left, created_at, weekdays,"
+        " weekly_time, confirmation_required) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             target,
             text,
@@ -90,6 +118,7 @@ def add_reminder(conn, target, text, next_run, interval_seconds, repeats, weekda
             datetime.now().strftime(DATETIME_FMT),
             ",".join(map(str, weekdays)) if weekdays else None,
             next_run.strftime("%H:%M") if weekdays else None,
+            int(confirmation_required),
         ),
     )
     conn.commit()
@@ -128,7 +157,11 @@ def delete_reminder(conn, reminder_id):
 
 def next_run_time(conn):
     """Время ближайшего напоминания или None, если их нет."""
-    row = conn.execute("SELECT MIN(next_run) AS m FROM reminders WHERE paused = 0").fetchone()
+    row = conn.execute(
+        "SELECT MIN(t) AS m FROM ("
+        " SELECT next_run AS t FROM reminders WHERE paused = 0"
+        " UNION ALL SELECT next_retry AS t FROM pending_confirmations)"
+    ).fetchone()
     if row["m"] is None:
         return None
     return datetime.strptime(row["m"], DATETIME_FMT)
@@ -258,13 +291,16 @@ def delete_notice(conn, notice_id):
     conn.commit()
 
 
-def replace_reminder(conn, reminder_id, target, text, next_run, interval_seconds, repeats, weekdays=None):
+def replace_reminder(conn, reminder_id, target, text, next_run, interval_seconds, repeats,
+                     weekdays=None, confirmation_required=False):
     conn.execute(
         "UPDATE reminders SET target = ?, text = ?, next_run = ?, interval_seconds = ?,"
-        " repeats_left = ?, weekdays = ?, weekly_time = ?, paused = 0 WHERE id = ?",
+        " repeats_left = ?, weekdays = ?, weekly_time = ?, confirmation_required = ?,"
+        " paused = 0 WHERE id = ?",
         (target, text, next_run.strftime(DATETIME_FMT), interval_seconds, repeats,
          ",".join(map(str, weekdays)) if weekdays else None,
-         next_run.strftime("%H:%M") if weekdays else None, reminder_id),
+         next_run.strftime("%H:%M") if weekdays else None, int(confirmation_required),
+         reminder_id),
     )
     conn.commit()
 
@@ -293,14 +329,17 @@ def set_paused(conn, reminder_id, paused, now=None):
 
 
 def record_history(conn, reminder_id, target, text, scheduled_for, status,
-                   detail=None, message_id=None, source_id=None):
+                   detail=None, message_id=None, source_id=None, chat_id=None,
+                   pending_id=None, confirmation_requested=False):
     scheduled = (scheduled_for.strftime(DATETIME_FMT) if isinstance(scheduled_for, datetime)
                  else scheduled_for)
     cur = conn.execute(
         "INSERT INTO history (reminder_id, target, text, scheduled_for, occurred_at,"
-        " status, detail, message_id, source_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        " status, detail, message_id, source_id, chat_id, pending_id,"
+        " confirmation_requested) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (reminder_id, target, text, scheduled, datetime.now().strftime(DATETIME_FMT),
-         status, detail, message_id, source_id),
+         status, detail, message_id, source_id, chat_id, pending_id,
+         int(confirmation_requested)),
     )
     conn.commit()
     return cur.lastrowid
@@ -310,10 +349,15 @@ def list_history(conn, limit=20):
     return conn.execute("SELECT * FROM history ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
 
 
-def get_sent_by_message(conn, message_id):
+def get_sent_by_message(conn, message_id, chat_id=None):
+    if chat_id is None:
+        return conn.execute(
+            "SELECT * FROM history WHERE message_id = ? AND status = 'sent'"
+            " ORDER BY id DESC LIMIT 1", (message_id,),
+        ).fetchone()
     return conn.execute(
-        "SELECT * FROM history WHERE message_id = ? AND status = 'sent'"
-        " ORDER BY id DESC LIMIT 1", (message_id,),
+        "SELECT * FROM history WHERE message_id = ? AND chat_id = ? AND status = 'sent'"
+        " ORDER BY id DESC LIMIT 1", (message_id, chat_id),
     ).fetchone()
 
 
@@ -329,3 +373,103 @@ def has_action(conn, source_id, status):
         "SELECT 1 FROM history WHERE source_id = ? AND status = ? LIMIT 1",
         (source_id, status),
     ).fetchone() is not None
+
+
+def set_confirmation(conn, reminder_id, required):
+    conn.execute(
+        "UPDATE reminders SET confirmation_required = ? WHERE id = ?",
+        (int(required), reminder_id),
+    )
+    conn.commit()
+
+
+def open_pending(conn, reminder_id, target, text, chat_id):
+    now = datetime.now()
+    next_retry = now + timedelta(seconds=CONFIRM_RETRY_SECONDS)
+    # A new scheduled occurrence supersedes replies to the previous one.
+    conn.execute("DELETE FROM pending_confirmations WHERE reminder_id = ?", (reminder_id,))
+    conn.execute(
+        "INSERT INTO pending_confirmations"
+        " (reminder_id, target, text, chat_id, next_retry, retry_seconds, created_at)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (reminder_id, target, text, chat_id, next_retry.strftime(DATETIME_FMT),
+         CONFIRM_RETRY_SECONDS, now.strftime(DATETIME_FMT)),
+    )
+    conn.commit()
+    return conn.execute(
+        "SELECT id FROM pending_confirmations WHERE reminder_id = ?", (reminder_id,)
+    ).fetchone()["id"]
+
+
+def get_pending(conn, pending_id):
+    return conn.execute(
+        "SELECT * FROM pending_confirmations WHERE id = ?", (pending_id,)
+    ).fetchone()
+
+
+def get_pending_by_reminder(conn, reminder_id):
+    return conn.execute(
+        "SELECT * FROM pending_confirmations WHERE reminder_id = ?", (reminder_id,)
+    ).fetchone()
+
+
+def list_pending(conn):
+    return conn.execute(
+        "SELECT * FROM pending_confirmations ORDER BY next_retry"
+    ).fetchall()
+
+
+def pending_for_chat(conn, chat_id):
+    return conn.execute(
+        "SELECT * FROM pending_confirmations WHERE chat_id = ? ORDER BY next_retry",
+        (chat_id,),
+    ).fetchall()
+
+
+def due_pending(conn, now):
+    return conn.execute(
+        "SELECT * FROM pending_confirmations WHERE next_retry <= ? ORDER BY next_retry",
+        (now.strftime(DATETIME_FMT),),
+    ).fetchall()
+
+
+def close_pending(conn, pending_id):
+    conn.execute("DELETE FROM pending_confirmations WHERE id = ?", (pending_id,))
+    conn.commit()
+
+
+def close_pending_for_reminder(conn, reminder_id):
+    conn.execute(
+        "DELETE FROM pending_confirmations WHERE reminder_id = ?", (reminder_id,)
+    )
+    conn.commit()
+
+
+def defer_pending(conn, pending_id, seconds):
+    when = datetime.now() + timedelta(seconds=seconds)
+    conn.execute(
+        "UPDATE pending_confirmations SET next_retry = ? WHERE id = ?",
+        (when.strftime(DATETIME_FMT), pending_id),
+    )
+    conn.commit()
+    return when
+
+
+def skip_pending_missed(conn, row, now):
+    start = datetime.strptime(row["next_retry"], DATETIME_FMT)
+    step = row["retry_seconds"]
+    count = int((now - start).total_seconds()) // step + 1
+    future = start + timedelta(seconds=count * step)
+    conn.execute(
+        "UPDATE pending_confirmations SET next_retry = ? WHERE id = ?",
+        (future.strftime(DATETIME_FMT), row["id"]),
+    )
+    conn.commit()
+    return count
+
+
+def last_sent_for_pending(conn, pending_id):
+    return conn.execute(
+        "SELECT * FROM history WHERE pending_id = ? AND status = 'sent'"
+        " ORDER BY id DESC LIMIT 1", (pending_id,),
+    ).fetchone()

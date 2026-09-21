@@ -49,6 +49,7 @@ async def main():
                     event.raw_text or "", client, conn,
                     reply_to_msg_id=reply.reply_to_msg_id if reply else None,
                     interpreter=interpreter,
+                    chat_id=event.chat_id,
                 )
                 if response:
                     wake_event.set()
@@ -62,6 +63,24 @@ async def main():
                     )
                 except Exception:
                     log.exception("Не удалось сообщить об ошибке в тему")
+
+        @client.on(events.NewMessage(incoming=True))
+        async def on_recipient_reply(event):
+            if not event.is_private or event.sender_id == me.id:
+                return
+            try:
+                reply = event.message.reply_to
+                response = await commands.handle_recipient_reply(
+                    event.raw_text or "", event.sender_id, event.chat_id,
+                    reply.reply_to_msg_id if reply else None, client, conn,
+                    interpreter=interpreter,
+                )
+                if response:
+                    wake_event.set()
+                    await client.send_message(event.chat_id, response, parse_mode=None)
+            except Exception:
+                log.exception("Ошибка обработки ответа адресата")
+                db.add_notice(conn, "Ошибка обработки ответа адресата. Проверьте журнал приложения.")
 
         await control.send("✅ Приложение запущено. Команды и личные напоминания работают в этой теме.")
         scheduler_task = asyncio.create_task(

@@ -63,6 +63,7 @@ async def scheduler_loop(client, conn, wake_event, send_delay, control):
 
         try:
             await _process_due(client, conn, send_delay, control)
+            await _process_pending(client, conn, send_delay, control)
             await _send_notices(conn, control)
             last_problem_notice = None
         except (OSError, ConnectionError, asyncio.TimeoutError):
@@ -90,6 +91,15 @@ async def _send_notices(conn, control):
         db.delete_notice(conn, notice["id"])
 
 
+def _delivery_text(row, followup=False):
+    header = f"⏰ {'Повторное напоминание' if followup else 'Напоминание'} #{row['reminder_id'] if followup else row['id']}\n"
+    body = row["text"]
+    if followup or row["confirmation_required"]:
+        body += ("\n\nСделали? Ответьте «готово» или «не сделал». "
+                 "Можно написать «напомни через 3 мин».")
+    return header + body
+
+
 async def _process_due(client, conn, send_delay, control):
     checked_at = datetime.now()
     sent = 0
@@ -114,14 +124,23 @@ async def _process_due(client, conn, send_delay, control):
         if sent:
             await asyncio.sleep(send_delay)
         try:
+            confirmed = bool(row["confirmation_required"])
             if row["target"] == "me":
-                message = await control.send(f"⏰ Напоминание #{row['id']}\n{row['text']}")
-                message_id = getattr(message, "id", None)
+                message = await control.send(_delivery_text(row))
+                chat_id = getattr(control, "chat_id", None)
             else:
-                await client.send_message(row["target"], row["text"], parse_mode=None)
-                message_id = None
+                recipient = await client.get_entity(row["target"]) if confirmed else None
+                message = await client.send_message(
+                    recipient or row["target"],
+                    _delivery_text(row) if confirmed else row["text"], parse_mode=None,
+                )
+                chat_id = recipient.id if recipient else getattr(message, "chat_id", None)
+            message_id = getattr(message, "id", None)
+            pending_id = (db.open_pending(conn, row["id"], row["target"], row["text"], chat_id)
+                          if confirmed else None)
             db.record_history(conn, row["id"], row["target"], row["text"], due_at,
-                              "sent", message_id=message_id)
+                              "sent", message_id=message_id, chat_id=chat_id,
+                              pending_id=pending_id, confirmation_requested=confirmed)
             db.advance(conn, row)
             sent += 1
             log.info("Отправлено напоминание #%d → %s", row["id"], row["target"])
@@ -141,6 +160,48 @@ async def _process_due(client, conn, send_delay, control):
                 f"Не отправлено #{row['id']} → {row['target']} "
                 f"({type(exc).__name__}). Повторю через 5 минут.",
             )
+
+
+async def _process_pending(client, conn, send_delay, control):
+    checked_at = datetime.now()
+    sent = 0
+    for row in db.due_pending(conn, checked_at):
+        due_at = datetime.strptime(row["next_retry"], db.DATETIME_FMT)
+        if checked_at - due_at > MISSED_AFTER:
+            count = db.skip_pending_missed(conn, row, checked_at)
+            db.record_history(conn, row["reminder_id"], row["target"], row["text"],
+                              due_at, "missed", detail=f"{count} повторов подтверждения")
+            db.add_notice(conn, f"Пропущено #{row['reminder_id']} → {row['target']}: "
+                                f"{count} повторов подтверждения. Следующий по расписанию.")
+            continue
+        if sent:
+            await asyncio.sleep(send_delay)
+        try:
+            if row["target"] == "me":
+                message = await control.send(_delivery_text(row, followup=True))
+            else:
+                recipient = await client.get_input_entity(row["chat_id"])
+                message = await client.send_message(
+                    recipient, _delivery_text(row, followup=True), parse_mode=None,
+                )
+            db.record_history(conn, row["reminder_id"], row["target"], row["text"],
+                              due_at, "sent", message_id=getattr(message, "id", None),
+                              chat_id=row["chat_id"], pending_id=row["id"],
+                              confirmation_requested=True)
+            db.defer_pending(conn, row["id"], row["retry_seconds"])
+            sent += 1
+        except FloodWaitError as exc:
+            await asyncio.sleep(exc.seconds + 5)
+            return
+        except (OSError, ConnectionError, asyncio.TimeoutError):
+            raise
+        except Exception as exc:
+            log.exception("Не удалось повторить напоминание #%d", row["reminder_id"])
+            db.record_history(conn, row["reminder_id"], row["target"], row["text"],
+                              due_at, "failed", detail=type(exc).__name__)
+            db.defer_pending(conn, row["id"], 300)
+            db.add_notice(conn, f"Не отправлено повторное напоминание #{row['reminder_id']} "
+                                f"({type(exc).__name__}). Повторю через 5 минут.")
 
 
 async def _sleep_until_next(conn, wake_event):
