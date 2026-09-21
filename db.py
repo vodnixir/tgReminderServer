@@ -21,13 +21,17 @@ CREATE TABLE IF NOT EXISTS reminders (
     created_at TEXT NOT NULL,
     scheduled_msg_id INTEGER
 );
+CREATE TABLE IF NOT EXISTS notices (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    text TEXT NOT NULL
+);
 """
 
 
 def connect(path):
     conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
-    conn.execute(_SCHEMA)
+    conn.executescript(_SCHEMA)
     _migrate(conn)
     conn.commit()
     return conn
@@ -77,22 +81,18 @@ def get_reminder(conn, reminder_id):
     ).fetchone()
 
 
-def set_scheduled_msg_id(conn, reminder_id, msg_id):
+def legacy_scheduled(conn):
+    return conn.execute(
+        "SELECT * FROM reminders WHERE scheduled_msg_id IS NOT NULL"
+    ).fetchall()
+
+
+def clear_scheduled_msg_id(conn, reminder_id):
     conn.execute(
-        "UPDATE reminders SET scheduled_msg_id = ? WHERE id = ?",
-        (msg_id, reminder_id),
+        "UPDATE reminders SET scheduled_msg_id = NULL WHERE id = ?",
+        (reminder_id,),
     )
     conn.commit()
-
-
-def needing_schedule(conn, not_before):
-    """Напоминания, не стоящие в серверном планировщике, до которых ещё
-    достаточно времени, чтобы туда попасть."""
-    return conn.execute(
-        "SELECT * FROM reminders"
-        " WHERE scheduled_msg_id IS NULL AND next_run >= ?",
-        (not_before.strftime(DATETIME_FMT),),
-    ).fetchall()
 
 
 def delete_reminder(conn, reminder_id):
@@ -128,10 +128,11 @@ def advance(conn, row):
         # Если хост был выключен и пропущено несколько интервалов,
         # догонять их не нужно — берём ближайшее будущее время.
         next_run = datetime.strptime(row["next_run"], DATETIME_FMT)
-        step = timedelta(seconds=row["interval_seconds"])
+        step_seconds = row["interval_seconds"]
         now = datetime.now()
-        while next_run <= now:
-            next_run += step
+        if next_run <= now:
+            elapsed = int((now - next_run).total_seconds())
+            next_run += timedelta(seconds=(elapsed // step_seconds + 1) * step_seconds)
         conn.execute(
             "UPDATE reminders SET next_run = ?, repeats_left = ?,"
             " scheduled_msg_id = NULL WHERE id = ?",
@@ -147,4 +148,47 @@ def postpone(conn, row, minutes):
         "UPDATE reminders SET next_run = ? WHERE id = ?",
         (next_run.strftime(DATETIME_FMT), row["id"]),
     )
+    conn.commit()
+
+
+def skip_missed(conn, row, now):
+    """Skip overdue occurrences and return their count."""
+    if row["interval_seconds"] is None:
+        delete_reminder(conn, row["id"])
+        return 1
+
+    start = datetime.strptime(row["next_run"], DATETIME_FMT)
+    step_seconds = row["interval_seconds"]
+    elapsed = int((now - start).total_seconds())
+    count = elapsed // step_seconds + 1
+    if row["repeats_left"] > 0:
+        count = min(count, row["repeats_left"])
+        remaining = row["repeats_left"] - count
+        if remaining == 0:
+            delete_reminder(conn, row["id"])
+            return count
+    else:
+        remaining = -1
+
+    next_run = start + timedelta(seconds=(elapsed // step_seconds + 1) * step_seconds)
+    conn.execute(
+        "UPDATE reminders SET next_run = ?, repeats_left = ?, scheduled_msg_id = NULL"
+        " WHERE id = ?",
+        (next_run.strftime(DATETIME_FMT), remaining, row["id"]),
+    )
+    conn.commit()
+    return count
+
+
+def add_notice(conn, text):
+    conn.execute("INSERT INTO notices (text) VALUES (?)", (text,))
+    conn.commit()
+
+
+def pending_notices(conn):
+    return conn.execute("SELECT * FROM notices ORDER BY id").fetchall()
+
+
+def delete_notice(conn, notice_id):
+    conn.execute("DELETE FROM notices WHERE id = ?", (notice_id,))
     conn.commit()

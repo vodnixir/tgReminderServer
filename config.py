@@ -20,8 +20,8 @@ except KeyError as e:
 SESSION_PATH = str(BASE_DIR / "reminder")  # создаст файл reminder.session
 DB_PATH = str(BASE_DIR / "reminders.db")
 
-SEND_DELAY = float(os.getenv("SEND_DELAY", "4"))  # пауза между отправками подряд
-
-# Токен бота от @BotFather (необязательно). Если задан, напоминания «себе»
-# приходят от бота — как входящие, с пуш-уведомлением на телефоне.
-BOT_TOKEN = os.getenv("BOT_TOKEN") or None
+SEND_DELAY = float(os.getenv("SEND_DELAY", "0"))
+if SEND_DELAY < 0:
+    raise SystemExit("SEND_DELAY не может быть отрицательным.")
+CONTROL_GROUP = os.getenv("CONTROL_GROUP", "repeat until")
+CONTROL_TOPIC = os.getenv("CONTROL_TOPIC", "reminders")

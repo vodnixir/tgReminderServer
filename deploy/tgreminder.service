@@ -16,7 +16,7 @@ Type=simple
 User=pi
 WorkingDirectory=/home/pi/tgproj
 ExecStart=/home/pi/tgproj/venv/bin/python main.py
-Restart=on-failure
+Restart=always
 RestartSec=10
 
 [Install]
