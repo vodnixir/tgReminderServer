@@ -7,8 +7,10 @@ from telethon import TelegramClient, events
 
 import commands
 import db
+from ai import GroqInterpreter
 from config import (
-    API_HASH, API_ID, CONTROL_GROUP, CONTROL_TOPIC, DB_PATH, SEND_DELAY,
+    API_HASH, API_ID, CONTROL_GROUP, CONTROL_TOPIC, DB_PATH, GROQ_API_KEY,
+    GROQ_MODEL, SEND_DELAY,
     SESSION_PATH,
 )
 from control import find_control_topic
@@ -35,13 +37,19 @@ async def main():
 
         await cancel_legacy_scheduled(client, conn)
         wake_event = asyncio.Event()
+        interpreter = GroqInterpreter(GROQ_API_KEY, GROQ_MODEL) if GROQ_API_KEY else None
 
         @client.on(events.NewMessage(outgoing=True, chats=control.peer))
         async def on_command(event):
             if event.sender_id != me.id or not control.contains(event):
                 return
             try:
-                response = await commands.handle(event.raw_text or "", client, conn)
+                reply = event.message.reply_to
+                response = await commands.handle(
+                    event.raw_text or "", client, conn,
+                    reply_to_msg_id=reply.reply_to_msg_id if reply else None,
+                    interpreter=interpreter,
+                )
                 if response:
                     wake_event.set()
                     await control.send(response)

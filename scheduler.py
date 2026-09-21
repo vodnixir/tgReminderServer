@@ -102,6 +102,8 @@ async def _process_due(client, conn, send_delay, control):
             continue
         if checked_at - due_at > MISSED_AFTER:
             count = db.skip_missed(conn, row, checked_at)
+            db.record_history(conn, row["id"], row["target"], row["text"], due_at,
+                              "missed", detail=f"{count} отправок")
             who = "себе" if row["target"] == "me" else row["target"]
             db.add_notice(
                 conn,
@@ -113,9 +115,13 @@ async def _process_due(client, conn, send_delay, control):
             await asyncio.sleep(send_delay)
         try:
             if row["target"] == "me":
-                await control.send(f"⏰ Напоминание #{row['id']}\n{row['text']}")
+                message = await control.send(f"⏰ Напоминание #{row['id']}\n{row['text']}")
+                message_id = getattr(message, "id", None)
             else:
                 await client.send_message(row["target"], row["text"], parse_mode=None)
+                message_id = None
+            db.record_history(conn, row["id"], row["target"], row["text"], due_at,
+                              "sent", message_id=message_id)
             db.advance(conn, row)
             sent += 1
             log.info("Отправлено напоминание #%d → %s", row["id"], row["target"])
@@ -127,6 +133,8 @@ async def _process_due(client, conn, send_delay, control):
             raise
         except Exception as exc:
             log.exception("Не удалось отправить напоминание #%d", row["id"])
+            db.record_history(conn, row["id"], row["target"], row["text"], due_at,
+                              "failed", detail=type(exc).__name__)
             db.postpone(conn, row, 5)
             db.add_notice(
                 conn,

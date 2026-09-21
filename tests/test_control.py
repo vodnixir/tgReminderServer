@@ -60,7 +60,8 @@ class TopicLookupTests(unittest.IsolatedAsyncioTestCase):
         client = Client()
         topic = ControlTopic(client, "peer", -100123, 42)
         await topic.send("x" * 4001)
-        self.assertEqual([len(args[1]) for args, _ in client.sent], [3900, 101])
+        self.assertEqual([len(args[1]) for args, _ in client.sent], [3901, 102])
+        self.assertTrue(all(args[1].startswith("\u2063") for args, _ in client.sent))
         self.assertTrue(all(kwargs["reply_to"] == 42 for _, kwargs in client.sent))
 
 

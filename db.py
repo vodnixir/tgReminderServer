@@ -19,12 +19,29 @@ CREATE TABLE IF NOT EXISTS reminders (
     interval_seconds INTEGER,
     repeats_left INTEGER NOT NULL DEFAULT 1,
     created_at TEXT NOT NULL,
-    scheduled_msg_id INTEGER
+    scheduled_msg_id INTEGER,
+    weekdays TEXT,
+    weekly_time TEXT,
+    paused INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS notices (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     text TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    reminder_id INTEGER NOT NULL,
+    target TEXT NOT NULL,
+    text TEXT NOT NULL,
+    scheduled_for TEXT NOT NULL,
+    occurred_at TEXT NOT NULL,
+    status TEXT NOT NULL,
+    detail TEXT,
+    message_id INTEGER,
+    source_id INTEGER
+);
+CREATE INDEX IF NOT EXISTS history_message_idx ON history(message_id);
+CREATE INDEX IF NOT EXISTS history_reminder_idx ON history(reminder_id, id);
 """
 
 
@@ -51,13 +68,19 @@ def _migrate(conn):
     # id сообщения в серверном планировщике Telegram появился позже.
     if "scheduled_msg_id" not in cols:
         conn.execute("ALTER TABLE reminders ADD COLUMN scheduled_msg_id INTEGER")
+    if "weekdays" not in cols:
+        conn.execute("ALTER TABLE reminders ADD COLUMN weekdays TEXT")
+    if "weekly_time" not in cols:
+        conn.execute("ALTER TABLE reminders ADD COLUMN weekly_time TEXT")
+    if "paused" not in cols:
+        conn.execute("ALTER TABLE reminders ADD COLUMN paused INTEGER NOT NULL DEFAULT 0")
 
 
-def add_reminder(conn, target, text, next_run, interval_seconds, repeats):
+def add_reminder(conn, target, text, next_run, interval_seconds, repeats, weekdays=None):
     cur = conn.execute(
         "INSERT INTO reminders"
-        " (target, text, next_run, interval_seconds, repeats_left, created_at)"
-        " VALUES (?, ?, ?, ?, ?, ?)",
+        " (target, text, next_run, interval_seconds, repeats_left, created_at, weekdays, weekly_time)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         (
             target,
             text,
@@ -65,6 +88,8 @@ def add_reminder(conn, target, text, next_run, interval_seconds, repeats):
             interval_seconds,
             repeats,
             datetime.now().strftime(DATETIME_FMT),
+            ",".join(map(str, weekdays)) if weekdays else None,
+            next_run.strftime("%H:%M") if weekdays else None,
         ),
     )
     conn.commit()
@@ -103,7 +128,7 @@ def delete_reminder(conn, reminder_id):
 
 def next_run_time(conn):
     """Время ближайшего напоминания или None, если их нет."""
-    row = conn.execute("SELECT MIN(next_run) AS m FROM reminders").fetchone()
+    row = conn.execute("SELECT MIN(next_run) AS m FROM reminders WHERE paused = 0").fetchone()
     if row["m"] is None:
         return None
     return datetime.strptime(row["m"], DATETIME_FMT)
@@ -111,9 +136,25 @@ def next_run_time(conn):
 
 def due_reminders(conn, now):
     return conn.execute(
-        "SELECT * FROM reminders WHERE next_run <= ? ORDER BY next_run",
+        "SELECT * FROM reminders WHERE paused = 0 AND next_run <= ? ORDER BY next_run",
         (now.strftime(DATETIME_FMT),),
     ).fetchall()
+
+
+def next_weekday(after, weekdays, time_text):
+    """First selected local weekday strictly after `after`."""
+    hour, minute = map(int, time_text.split(":"))
+    selected = set(int(day) for day in weekdays)
+    for offset in range(8):
+        day = after.date() + timedelta(days=offset)
+        candidate = datetime(day.year, day.month, day.day, hour, minute)
+        if candidate.weekday() in selected and candidate > after:
+            return candidate
+    raise ValueError("Не выбраны дни недели")
+
+
+def _days(row):
+    return tuple(map(int, row["weekdays"].split(",")))
 
 
 def advance(conn, row):
@@ -122,8 +163,15 @@ def advance(conn, row):
     if repeats_left > 0:
         repeats_left -= 1
 
-    if repeats_left == 0 or row["interval_seconds"] is None:
+    if repeats_left == 0 or (row["interval_seconds"] is None and not row["weekdays"]):
         conn.execute("DELETE FROM reminders WHERE id = ?", (row["id"],))
+    elif row["weekdays"]:
+        next_run = next_weekday(datetime.now(), _days(row), row["weekly_time"])
+        conn.execute(
+            "UPDATE reminders SET next_run = ?, repeats_left = ?, scheduled_msg_id = NULL"
+            " WHERE id = ?",
+            (next_run.strftime(DATETIME_FMT), repeats_left, row["id"]),
+        )
     else:
         # Если хост был выключен и пропущено несколько интервалов,
         # догонять их не нужно — берём ближайшее будущее время.
@@ -153,6 +201,22 @@ def postpone(conn, row, minutes):
 
 def skip_missed(conn, row, now):
     """Skip overdue occurrences and return their count."""
+    if row["weekdays"]:
+        candidate = datetime.strptime(row["next_run"], DATETIME_FMT)
+        count = 0
+        while candidate <= now and (row["repeats_left"] < 0 or count < row["repeats_left"]):
+            count += 1
+            candidate = next_weekday(candidate, _days(row), row["weekly_time"])
+        remaining = row["repeats_left"] - count if row["repeats_left"] > 0 else -1
+        if remaining == 0:
+            delete_reminder(conn, row["id"])
+        else:
+            conn.execute(
+                "UPDATE reminders SET next_run = ?, repeats_left = ? WHERE id = ?",
+                (candidate.strftime(DATETIME_FMT), remaining, row["id"]),
+            )
+            conn.commit()
+        return count
     if row["interval_seconds"] is None:
         delete_reminder(conn, row["id"])
         return 1
@@ -192,3 +256,76 @@ def pending_notices(conn):
 def delete_notice(conn, notice_id):
     conn.execute("DELETE FROM notices WHERE id = ?", (notice_id,))
     conn.commit()
+
+
+def replace_reminder(conn, reminder_id, target, text, next_run, interval_seconds, repeats, weekdays=None):
+    conn.execute(
+        "UPDATE reminders SET target = ?, text = ?, next_run = ?, interval_seconds = ?,"
+        " repeats_left = ?, weekdays = ?, weekly_time = ?, paused = 0 WHERE id = ?",
+        (target, text, next_run.strftime(DATETIME_FMT), interval_seconds, repeats,
+         ",".join(map(str, weekdays)) if weekdays else None,
+         next_run.strftime("%H:%M") if weekdays else None, reminder_id),
+    )
+    conn.commit()
+
+
+def set_paused(conn, reminder_id, paused, now=None):
+    now = now or datetime.now()
+    row = get_reminder(conn, reminder_id)
+    if row is None:
+        return False
+    next_run = datetime.strptime(row["next_run"], DATETIME_FMT)
+    if not paused and next_run <= now:
+        if row["weekdays"]:
+            next_run = next_weekday(now, _days(row), row["weekly_time"])
+        elif row["interval_seconds"]:
+            step = row["interval_seconds"]
+            elapsed = int((now - next_run).total_seconds())
+            next_run += timedelta(seconds=(elapsed // step + 1) * step)
+        else:
+            next_run = now + timedelta(minutes=1)
+    conn.execute(
+        "UPDATE reminders SET paused = ?, next_run = ? WHERE id = ?",
+        (int(paused), next_run.strftime(DATETIME_FMT), reminder_id),
+    )
+    conn.commit()
+    return True
+
+
+def record_history(conn, reminder_id, target, text, scheduled_for, status,
+                   detail=None, message_id=None, source_id=None):
+    scheduled = (scheduled_for.strftime(DATETIME_FMT) if isinstance(scheduled_for, datetime)
+                 else scheduled_for)
+    cur = conn.execute(
+        "INSERT INTO history (reminder_id, target, text, scheduled_for, occurred_at,"
+        " status, detail, message_id, source_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (reminder_id, target, text, scheduled, datetime.now().strftime(DATETIME_FMT),
+         status, detail, message_id, source_id),
+    )
+    conn.commit()
+    return cur.lastrowid
+
+
+def list_history(conn, limit=20):
+    return conn.execute("SELECT * FROM history ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+
+
+def get_sent_by_message(conn, message_id):
+    return conn.execute(
+        "SELECT * FROM history WHERE message_id = ? AND status = 'sent'"
+        " ORDER BY id DESC LIMIT 1", (message_id,),
+    ).fetchone()
+
+
+def get_last_sent(conn, reminder_id):
+    return conn.execute(
+        "SELECT * FROM history WHERE reminder_id = ? AND status = 'sent'"
+        " ORDER BY id DESC LIMIT 1", (reminder_id,),
+    ).fetchone()
+
+
+def has_action(conn, source_id, status):
+    return conn.execute(
+        "SELECT 1 FROM history WHERE source_id = ? AND status = ? LIMIT 1",
+        (source_id, status),
+    ).fetchone() is not None

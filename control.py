@@ -22,7 +22,7 @@ class ControlTopic:
         sent = None
         for start in range(0, len(text), 3900):
             sent = await self.client.send_message(
-                self.peer, text[start:start + 3900], reply_to=self.topic_id,
+                self.peer, "\u2063" + text[start:start + 3900], reply_to=self.topic_id,
                 parse_mode=None, link_preview=False,
             )
         return sent
