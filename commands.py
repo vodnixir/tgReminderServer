@@ -39,6 +39,10 @@ WEEKLY = re.compile(
     r"(?:понедельник|вторник|среду|среда|четверг|пятницу|пятница|субботу|суббота|воскресенье))\s+"
 )
 CONFIRM_PREFIX = re.compile(r"(?i)^(с|без)\s+подтверждени(?:ем|я)\b\s*")
+DELETE_INTENT = re.compile(
+    r"(?i)^/?\s*(?:(?:можешь|пожалуйста)\s+)?"
+    r"(?:удали|удалить|убери|убрать|отмени|отменить|сотри)\b"
+)
 
 HELP = """Пишите команды в этой теме. / в начале необязателен.
 
@@ -321,6 +325,22 @@ def _sent_context(conn, reply_to_msg_id, reminder_id=None, chat_id=None):
     return None
 
 
+def _resolve_sent(conn, reply_to_msg_id, reminder_id=None, chat_id=None):
+    sent = _sent_context(conn, reply_to_msg_id, reminder_id, chat_id)
+    if sent is not None or reply_to_msg_id or reminder_id:
+        return sent
+    recent = db.recent_sent(conn, chat_id)
+    return recent[0] if len(recent) == 1 else None
+
+
+def _missing_sent(conn, chat_id=None):
+    recent = db.recent_sent(conn, chat_id, limit=5)
+    if recent:
+        options = ", ".join(f"#{row['reminder_id']} — {row['text'][:30]}" for row in recent)
+        return f"Уточните, какое напоминание выполнено: {options}. Ответьте на него или укажите номер."
+    return "Не нашёл отправленное напоминание. Ответьте на его сообщение или укажите номер."
+
+
 def _number(text):
     match = re.fullmatch(r"#?(\d+)", text.strip())
     return int(match.group(1)) if match else None
@@ -328,7 +348,7 @@ def _number(text):
 
 def _done(conn, sent):
     if sent is None:
-        return "Ответьте на конкретное напоминание или укажите его номер: «готово 3»."
+        return _missing_sent(conn)
     if db.has_action(conn, sent["id"], "done"):
         return "Это напоминание уже отмечено выполненным."
     db.record_history(conn, sent["reminder_id"], sent["target"], sent["text"],
@@ -452,6 +472,25 @@ def _set_confirmation(conn, reminder_id, required):
     return f"Подтверждение для #{reminder_id} {'включено' if required else 'выключено'}."
 
 
+async def _delete(conn, client, reminder_id):
+    row = db.get_reminder(conn, reminder_id)
+    if row is None:
+        pending = db.get_pending_by_reminder(conn, reminder_id)
+        if pending is None:
+            return "Напоминание с таким номером не найдено. Проверьте «список»."
+        db.close_pending(conn, pending["id"])
+        return f"Ожидание подтверждения #{reminder_id} удалено."
+    if row["scheduled_msg_id"]:
+        try:
+            peer = await client.get_input_entity(row["target"])
+            await client(DeleteScheduledMessagesRequest(peer, id=[row["scheduled_msg_id"]]))
+        except Exception:
+            return "Не удалось снять старую запланированную отправку в Telegram. Повторите удаление позже."
+    db.delete_reminder(conn, reminder_id)
+    db.close_pending_for_reminder(conn, reminder_id)
+    return f"Напоминание #{reminder_id} удалено."
+
+
 def correct_ai_when(raw_text, when, weekdays, now):
     """Calculate explicit calendar phrases locally instead of trusting model arithmetic."""
     text = raw_text.casefold()
@@ -476,17 +515,24 @@ def correct_ai_when(raw_text, when, weekdays, now):
 async def _apply_ai(action, client, conn, reply_to_msg_id, raw_text, chat_id=None):
     kind = action["action"]
     rid = action.get("reminder_id")
-    sent = _sent_context(conn, reply_to_msg_id, rid, chat_id)
+    sent = _resolve_sent(conn, reply_to_msg_id, rid, chat_id)
     if kind == "none":
         return action.get("reason") or "Не понял запрос. Напишите «помощь» для примеров."
     if kind == "history":
         return format_history(db.list_history(conn, min(action.get("limit") or 20, 50)))
+    if kind == "list":
+        return format_list(db.list_reminders(conn), db.list_pending(conn))
+    if kind == "delete":
+        if not DELETE_INTENT.match(raw_text):
+            return "Уточните, какое напоминание удалить."
+        return await _delete(conn, client, rid)
     if kind == "complete":
-        return _done(conn, sent)
+        return _done(conn, sent) if sent else _missing_sent(conn, chat_id)
     if kind == "not_done":
-        return _not_done(conn, sent)
+        return _not_done(conn, sent) if sent else _missing_sent(conn, chat_id)
     if kind == "snooze":
-        return _snooze(conn, sent, action.get("duration_seconds"))
+        return (_snooze(conn, sent, action.get("duration_seconds")) if sent
+                else _missing_sent(conn, chat_id))
     if kind == "set_confirmation":
         return _set_confirmation(conn, rid, action["confirmation_required"])
     if kind in ("pause", "resume"):
@@ -538,6 +584,26 @@ async def handle(raw_text, client, conn, reply_to_msg_id=None, interpreter=None,
     text = raw_text.strip()
     if not text or text.startswith("\u2063"):
         return None
+    ai_reason = None
+    ai_failed = False
+    if interpreter is not None:
+        try:
+            reply = _sent_context(conn, reply_to_msg_id, chat_id=chat_id)
+            action = await interpreter.interpret(
+                text, datetime.now(), db.list_reminders(conn), reply,
+                db.recent_sent(conn, chat_id), db.list_pending(conn))
+        except Exception:
+            ai_failed = True
+        else:
+            if action["action"] == "delete" and not DELETE_INTENT.match(text):
+                action = {"action": "none"}
+            if action["action"] != "none":
+                try:
+                    return await _apply_ai(action, client, conn, reply_to_msg_id,
+                                           text, chat_id)
+                except Exception:
+                    return "Не удалось выполнить запрос через Groq. Проверьте журнал приложения."
+            ai_reason = action.get("reason")
     match = re.match(
         r"^/?\s*(напомни|напиши|список|list|история|удали|помощь|help|"
         r"готово|сделано|да|нет|не сделал(?:а)?|отложи|измени|пауза|возобнови|"
@@ -553,9 +619,11 @@ async def handle(raw_text, client, conn, reply_to_msg_id=None, interpreter=None,
         limit = _number(rest) if rest else 20
         return format_history(db.list_history(conn, min(max(limit or 20, 1), 50)))
     if command in ("готово", "сделано", "да"):
-        return _done(conn, _sent_context(conn, reply_to_msg_id, _number(rest), chat_id))
+        sent = _resolve_sent(conn, reply_to_msg_id, _number(rest), chat_id)
+        return _done(conn, sent) if sent else _missing_sent(conn, chat_id)
     if command in ("нет", "не сделал", "не сделала"):
-        return _not_done(conn, _sent_context(conn, reply_to_msg_id, _number(rest), chat_id))
+        sent = _resolve_sent(conn, reply_to_msg_id, _number(rest), chat_id)
+        return _not_done(conn, sent) if sent else _missing_sent(conn, chat_id)
     if command == "отложи":
         result = _snooze_command(conn, rest, reply_to_msg_id, chat_id)
         if interpreter is None or not result.startswith("Укажите срок"):
@@ -601,22 +669,7 @@ async def handle(raw_text, client, conn, reply_to_msg_id=None, interpreter=None,
     if command == "удали":
         if not re.fullmatch(r"#?\d+", rest):
             return "Укажите номер: «удали 3». Номера есть в команде «список»."
-        row = db.get_reminder(conn, int(rest.lstrip("#")))
-        if not row:
-            pending = db.get_pending_by_reminder(conn, int(rest.lstrip("#")))
-            if pending is None:
-                return "Напоминание с таким номером не найдено. Проверьте «список»."
-            db.close_pending(conn, pending["id"])
-            return f"Ожидание подтверждения #{pending['reminder_id']} удалено."
-        if row["scheduled_msg_id"]:
-            try:
-                peer = await client.get_input_entity(row["target"])
-                await client(DeleteScheduledMessagesRequest(peer, id=[row["scheduled_msg_id"]]))
-            except Exception:
-                return "Не удалось снять старую запланированную отправку в Telegram. Повторите удаление позже."
-        db.delete_reminder(conn, row["id"])
-        db.close_pending_for_reminder(conn, row["id"])
-        return f"Напоминание #{row['id']} удалено."
+        return await _delete(conn, client, int(rest.lstrip("#")))
     if command in ("напомни", "напиши"):
         try:
             spec = parse_reminder(rest)
@@ -625,15 +678,9 @@ async def handle(raw_text, client, conn, reply_to_msg_id=None, interpreter=None,
                 return f"{exc} Напишите «помощь» для примеров."
         else:
             return await _add(spec, client, conn)
-    if interpreter is None:
-        return None
-    try:
-        reply = _sent_context(conn, reply_to_msg_id, chat_id=chat_id)
-        action = await interpreter.interpret(
-            text, datetime.now(), db.list_reminders(conn), reply)
-        return await _apply_ai(action, client, conn, reply_to_msg_id, text, chat_id)
-    except Exception:
+    if ai_failed:
         return "Не удалось разобрать запрос через Groq. Повторите позже или напишите «помощь»."
+    return ai_reason
 
 
 async def handle_recipient_reply(raw_text, sender_id, chat_id, reply_to_msg_id,
@@ -644,41 +691,65 @@ async def handle_recipient_reply(raw_text, sender_id, chat_id, reply_to_msg_id,
     text = raw_text.strip()
     if not text:
         return None
+    open_items = db.pending_for_chat(conn, chat_id)
+    if not open_items:
+        return None
+    pending = None
+    sent = None
     if reply_to_msg_id:
         sent = db.get_sent_by_message(conn, reply_to_msg_id, chat_id)
         pending = db.get_pending(conn, sent["pending_id"]) if sent and sent["pending_id"] else None
-    else:
-        open_items = db.pending_for_chat(conn, chat_id)
-        if len(open_items) != 1:
-            if len(open_items) > 1 and re.search(
-                r"(?i)\b(?:сделал|сделала|готово|не сделал|напомни)\b", text
-            ):
-                return "Ответьте на конкретное напоминание: у вас несколько ожидают ответа."
+        if pending is None:
             return None
+    elif len(open_items) == 1:
         pending = open_items[0]
         sent = db.last_sent_for_pending(conn, pending["id"])
-    if not pending or not sent or pending["chat_id"] != chat_id or not sent["confirmation_requested"]:
-        return None
     normalized = re.sub(r"[!.,?\s]+$", "", text.casefold().strip())
+    exact_action = None
+    exact_seconds = None
     if re.fullmatch(r"(?:да[,]?\s*)?(?:сделал(?:а)?|готово|выполнил(?:а)?|сделано)|да", normalized):
-        return _done(conn, sent)
-    if re.fullmatch(r"(?:нет[,]?\s*)?(?:не\s+сделал(?:а)?|не\s+готово|не\s+выполнил(?:а)?)|нет", normalized):
-        return _not_done(conn, sent)
-    snooze = re.fullmatch(r"(?:напомни|напиши|отложи|повтори)\s+(?:мне\s+)?(?:через|на)\s+(.+)", normalized)
-    seconds = parse_duration(snooze.group(1)) if snooze else None
-    if seconds:
-        return _snooze(conn, sent, seconds)
-    if interpreter is None:
+        exact_action = "complete"
+    elif re.fullmatch(r"(?:нет[,]?\s*)?(?:не\s+сделал(?:а)?|не\s+готово|не\s+выполнил(?:а)?)|нет", normalized):
+        exact_action = "not_done"
+    else:
+        snooze = re.fullmatch(r"(?:напомни|напиши|отложи|повтори)\s+(?:мне\s+)?(?:через|на)\s+(.+)", normalized)
+        exact_seconds = parse_duration(snooze.group(1)) if snooze else None
+        if exact_seconds:
+            exact_action = "snooze"
+
+    action = None
+    if interpreter is not None:
+        try:
+            action = await interpreter.interpret_response(
+                text, datetime.now(), pending if pending is not None else open_items)
+        except Exception:
+            if exact_action is None:
+                return "Не смог разобрать ответ. Напишите «готово», «не сделал» или «напомни через 3 мин»."
+    if pending is None:
+        if action is None or action["action"] == "none":
+            return ("Ответьте на конкретное напоминание: у вас несколько ожидают ответа."
+                    if exact_action or action is not None else None)
+        pending = next((item for item in open_items
+                        if item["reminder_id"] == action.get("reminder_id")), None)
+        if pending is None:
+            return "Ответьте на конкретное напоминание: у вас несколько ожидают ответа."
+        words = set(re.findall(r"[а-яёa-z]{4,}", normalized))
+        reminder_words = set(re.findall(r"[а-яёa-z]{4,}", pending["text"].casefold()))
+        named_id = re.search(rf"(?<!\d)#?{pending['reminder_id']}(?!\d)", normalized)
+        if not named_id and not words.intersection(reminder_words):
+            return "Ответьте на конкретное напоминание: у вас несколько ожидают ответа."
+        sent = db.last_sent_for_pending(conn, pending["id"])
+    if (not sent or pending["chat_id"] != chat_id or
+            not sent["confirmation_requested"]):
         return None
-    try:
-        action = await interpreter.interpret_response(text, datetime.now(), pending)
-    except Exception:
-        return "Не смог разобрать ответ. Напишите «готово», «не сделал» или «напомни через 3 мин»."
-    kind = action["action"]
+    if (exact_action is None and action is not None and
+            action.get("reminder_id") not in (None, pending["reminder_id"])):
+        return "Ответьте на конкретное напоминание, чтобы выбрать нужную задачу."
+    kind = exact_action or (action["action"] if action else "none")
     if kind == "complete":
         return _done(conn, sent)
     if kind == "not_done":
         return _not_done(conn, sent)
     if kind == "snooze":
-        return _snooze(conn, sent, action["duration_seconds"])
+        return _snooze(conn, sent, exact_seconds or action["duration_seconds"])
     return None

@@ -45,7 +45,7 @@ class AiTests(unittest.IsolatedAsyncioTestCase):
 
     def test_rejects_unsafe_or_incomplete_model_output(self):
         with self.assertRaises(ValueError):
-            validate_action({"action": "delete", "reminder_id": 1})
+            validate_action({"action": "delete"})
         with self.assertRaises(ValueError):
             validate_action({"action": "create", "when": "2026-09-22T10:00:00",
                              "target": "@person; rm -rf /", "text": "test"})

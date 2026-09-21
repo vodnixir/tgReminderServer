@@ -356,8 +356,10 @@ def get_sent_by_message(conn, message_id, chat_id=None):
             " ORDER BY id DESC LIMIT 1", (message_id,),
         ).fetchone()
     return conn.execute(
-        "SELECT * FROM history WHERE message_id = ? AND chat_id = ? AND status = 'sent'"
-        " ORDER BY id DESC LIMIT 1", (message_id, chat_id),
+        "SELECT * FROM history WHERE message_id = ? AND status = 'sent'"
+        " AND (chat_id = ? OR (chat_id IS NULL AND target = 'me'))"
+        " ORDER BY (chat_id = ?) DESC, id DESC LIMIT 1",
+        (message_id, chat_id, chat_id),
     ).fetchone()
 
 
@@ -366,6 +368,23 @@ def get_last_sent(conn, reminder_id):
         "SELECT * FROM history WHERE reminder_id = ? AND status = 'sent'"
         " ORDER BY id DESC LIMIT 1", (reminder_id,),
     ).fetchone()
+
+
+def recent_sent(conn, chat_id=None, limit=12, hours=24):
+    """Recent personal deliveries awaiting a completion mark."""
+    since = (datetime.now() - timedelta(hours=hours)).strftime(DATETIME_FMT)
+    chat_filter = " AND (h.chat_id = ? OR h.chat_id IS NULL)" if chat_id is not None else ""
+    params = (since, chat_id, limit) if chat_id is not None else (since, limit)
+    return conn.execute(
+        "SELECT h.* FROM history h WHERE h.status = 'sent' AND h.target = 'me'"
+        " AND h.occurred_at >= ?"
+        " AND NOT EXISTS (SELECT 1 FROM history newer WHERE newer.status = 'sent'"
+        " AND newer.target = 'me' AND newer.reminder_id = h.reminder_id"
+        " AND newer.id > h.id)"
+        " AND NOT EXISTS (SELECT 1 FROM history a WHERE a.source_id = h.id"
+        " AND a.status = 'done')" + chat_filter + " ORDER BY h.id DESC LIMIT ?",
+        params,
+    ).fetchall()
 
 
 def has_action(conn, source_id, status):
