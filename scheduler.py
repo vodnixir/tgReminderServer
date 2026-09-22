@@ -14,11 +14,62 @@ log = logging.getLogger(__name__)
 MAX_SLEEP = 30
 MISSED_AFTER = timedelta(minutes=1)
 RETRY_DELAY = 15
+PERSONAL_NOTIFICATION_WINDOW = timedelta(minutes=1)
+MIN_SCHEDULE_DELAY = timedelta(seconds=10)
+PERSONAL_NOTIFICATION_TTL = timedelta(minutes=5)
+NOTICE_TTL = timedelta(hours=1)
+MAX_CLEANUP_ATTEMPTS = 60
+
+
+def _notification_text(row):
+    return f"🔔 Напоминание #{row['id']}\n{row['text']}"
+
+
+async def _ensure_personal_notifications(client, conn, now=None):
+    """Schedule Saved Messages alerts only during the last minute before delivery."""
+    now = now or datetime.now()
+    earliest = now - MISSED_AFTER
+    latest = now + PERSONAL_NOTIFICATION_WINDOW
+    rows = conn.execute(
+        "SELECT * FROM reminders WHERE target = 'me' AND paused = 0"
+        " AND scheduled_msg_id IS NULL AND next_run > ? AND next_run <= ?"
+        " ORDER BY next_run",
+        (earliest.strftime(db.DATETIME_FMT), latest.strftime(db.DATETIME_FMT)),
+    ).fetchall()
+    for row in rows:
+        due_at = datetime.strptime(row["next_run"], db.DATETIME_FMT)
+        scheduled_at = max(due_at, now + MIN_SCHEDULE_DELAY)
+        try:
+            message = await client.send_message(
+                "me", _notification_text(row), parse_mode=None,
+                schedule=scheduled_at.astimezone(), silent=False,
+            )
+        except (OSError, ConnectionError, asyncio.TimeoutError):
+            raise
+        except FloodWaitError as exc:
+            log.warning("Не удалось запланировать уведомление #%d: FloodWait %d",
+                        row["id"], exc.seconds)
+            continue
+        except Exception:
+            log.exception("Не удалось запланировать уведомление #%d", row["id"])
+            continue
+        message_id = getattr(message, "id", None)
+        if message_id is not None:
+            db.set_scheduled_msg_id(conn, row["id"], message_id)
+            log.info("Уведомление #%d добавлено в Избранное на %s",
+                     row["id"], scheduled_at.strftime(db.DATETIME_FMT))
 
 
 async def cancel_legacy_scheduled(client, conn):
-    """Remove messages scheduled by older releases before direct delivery."""
+    """Remove persisted schedules so the current process can recreate them safely."""
     for row in db.legacy_scheduled(conn):
+        due_at = datetime.strptime(row["next_run"], db.DATETIME_FMT)
+        if row["target"] == "me" and due_at <= datetime.now():
+            db.queue_cleanup(
+                conn, "saved", row["scheduled_msg_id"],
+                max(due_at + PERSONAL_NOTIFICATION_TTL, datetime.now()),
+                reminder_id=row["id"], text=_notification_text(row), scheduled_for=due_at,
+            )
         try:
             peer = await client.get_input_entity(row["target"])
             await client(DeleteScheduledMessagesRequest(
@@ -62,8 +113,10 @@ async def scheduler_loop(client, conn, wake_event, send_delay, control):
             outage_started = None
 
         try:
+            await _ensure_personal_notifications(client, conn)
             await _process_due(client, conn, send_delay, control)
             await _process_pending(client, conn, send_delay, control)
+            await _process_cleanup(client, conn, control)
             await _send_notices(conn, control)
             last_problem_notice = None
         except (OSError, ConnectionError, asyncio.TimeoutError):
@@ -87,7 +140,9 @@ async def scheduler_loop(client, conn, wake_event, send_delay, control):
 
 async def _send_notices(conn, control):
     for notice in db.pending_notices(conn):
-        await control.send("⚠️ " + notice["text"])
+        message = await control.send("⚠️ " + notice["text"])
+        db.queue_cleanup(conn, "control", getattr(message, "id", None),
+                         datetime.now() + NOTICE_TTL)
         db.delete_notice(conn, notice["id"])
 
 
@@ -105,11 +160,16 @@ async def _process_due(client, conn, send_delay, control):
     sent = 0
     for row in db.due_reminders(conn, checked_at):
         due_at = datetime.strptime(row["next_run"], db.DATETIME_FMT)
-        if row["scheduled_msg_id"]:
+        if row["scheduled_msg_id"] and row["target"] != "me":
             # Старое сообщение осталось в серверном планировщике после
             # неудачного снятия. Повторно напрямую его не отправляем.
             db.advance(conn, row)
             continue
+        if row["scheduled_msg_id"]:
+            db.queue_cleanup(
+                conn, "saved", row["scheduled_msg_id"], due_at + PERSONAL_NOTIFICATION_TTL,
+                reminder_id=row["id"], text=_notification_text(row), scheduled_for=due_at,
+            )
         if checked_at - due_at > MISSED_AFTER:
             count = db.skip_missed(conn, row, checked_at)
             db.record_history(conn, row["id"], row["target"], row["text"], due_at,
@@ -160,6 +220,72 @@ async def _process_due(client, conn, send_delay, control):
                 f"Не отправлено #{row['id']} → {row['target']} "
                 f"({type(exc).__name__}). Повторю через 5 минут.",
             )
+
+
+def _local_naive(value):
+    if value.tzinfo is None:
+        return value
+    return value.astimezone().replace(tzinfo=None)
+
+
+async def _process_cleanup(client, conn, control, now=None):
+    """Delete expired topic traffic and delivered Saved Messages alerts."""
+    now = now or datetime.now()
+    rows = db.due_cleanup(conn, now)
+    control_rows = [row for row in rows if row["scope"] == "control"]
+    if control_rows:
+        control_ids = [row["id"] for row in control_rows]
+        try:
+            await client.delete_messages(
+                control.peer, [row["message_id"] for row in control_rows], revoke=True,
+            )
+        except (OSError, ConnectionError, asyncio.TimeoutError):
+            raise
+        except Exception:
+            log.exception("Не удалось очистить сообщения темы")
+            db.defer_cleanup(conn, control_ids)
+        else:
+            db.delete_cleanup(conn, control_ids)
+
+    saved_rows = [row for row in rows if row["scope"] == "saved"]
+    if not saved_rows:
+        return
+    try:
+        recent = await client.get_messages("me", limit=100)
+    except (OSError, ConnectionError, asyncio.TimeoutError):
+        raise
+    except Exception:
+        log.exception("Не удалось проверить уведомления в Избранном")
+        db.defer_cleanup(conn, [row["id"] for row in saved_rows])
+        return
+    for row in saved_rows:
+        scheduled_for = datetime.strptime(row["scheduled_for"], db.DATETIME_FMT)
+        matches = []
+        for message in recent:
+            message_date = getattr(message, "date", None)
+            if (getattr(message, "raw_text", None) == row["text"] and message_date
+                    and abs((_local_naive(message_date) - scheduled_for).total_seconds()) <= 900):
+                matches.append(message)
+        if not matches:
+            if row["attempts"] + 1 >= MAX_CLEANUP_ATTEMPTS:
+                db.delete_cleanup(conn, [row["id"]])
+            else:
+                db.defer_cleanup(conn, [row["id"]])
+            continue
+        delivered = min(
+            matches,
+            key=lambda message: abs((_local_naive(message.date) - scheduled_for).total_seconds()),
+        )
+        message_ids = sorted({row["message_id"], delivered.id})
+        try:
+            await client.delete_messages("me", message_ids, revoke=True)
+        except (OSError, ConnectionError, asyncio.TimeoutError):
+            raise
+        except Exception:
+            log.exception("Не удалось удалить уведомление из Избранного")
+            db.defer_cleanup(conn, [row["id"]])
+        else:
+            db.delete_cleanup(conn, [row["id"]])
 
 
 async def _process_pending(client, conn, send_delay, control):

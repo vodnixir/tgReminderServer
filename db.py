@@ -58,6 +58,18 @@ CREATE TABLE IF NOT EXISTS pending_confirmations (
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS pending_next_retry_idx ON pending_confirmations(next_retry);
+CREATE TABLE IF NOT EXISTS message_cleanup (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    scope TEXT NOT NULL CHECK(scope IN ('control', 'saved')),
+    message_id INTEGER NOT NULL,
+    delete_at TEXT NOT NULL,
+    reminder_id INTEGER,
+    text TEXT,
+    scheduled_for TEXT,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    UNIQUE(scope, message_id)
+);
+CREATE INDEX IF NOT EXISTS message_cleanup_due_idx ON message_cleanup(delete_at);
 """
 
 
@@ -149,6 +161,14 @@ def clear_scheduled_msg_id(conn, reminder_id):
     conn.commit()
 
 
+def set_scheduled_msg_id(conn, reminder_id, message_id):
+    conn.execute(
+        "UPDATE reminders SET scheduled_msg_id = ? WHERE id = ?",
+        (message_id, reminder_id),
+    )
+    conn.commit()
+
+
 def delete_reminder(conn, reminder_id):
     cur = conn.execute("DELETE FROM reminders WHERE id = ?", (reminder_id,))
     conn.commit()
@@ -160,7 +180,8 @@ def next_run_time(conn):
     row = conn.execute(
         "SELECT MIN(t) AS m FROM ("
         " SELECT next_run AS t FROM reminders WHERE paused = 0"
-        " UNION ALL SELECT next_retry AS t FROM pending_confirmations)"
+        " UNION ALL SELECT next_retry AS t FROM pending_confirmations"
+        " UNION ALL SELECT delete_at AS t FROM message_cleanup)"
     ).fetchone()
     if row["m"] is None:
         return None
@@ -492,3 +513,83 @@ def last_sent_for_pending(conn, pending_id):
         "SELECT * FROM history WHERE pending_id = ? AND status = 'sent'"
         " ORDER BY id DESC LIMIT 1", (pending_id,),
     ).fetchone()
+
+
+def queue_cleanup(conn, scope, message_id, delete_at, reminder_id=None, text=None,
+                  scheduled_for=None):
+    """Persist a Telegram message deletion, keeping the earliest requested time."""
+    if message_id is None:
+        return
+    delete_text = (delete_at.strftime(DATETIME_FMT)
+                   if isinstance(delete_at, datetime) else delete_at)
+    scheduled_text = (scheduled_for.strftime(DATETIME_FMT)
+                      if isinstance(scheduled_for, datetime) else scheduled_for)
+    conn.execute(
+        "INSERT INTO message_cleanup"
+        " (scope, message_id, delete_at, reminder_id, text, scheduled_for)"
+        " VALUES (?, ?, ?, ?, ?, ?)"
+        " ON CONFLICT(scope, message_id) DO UPDATE SET"
+        " delete_at = MIN(message_cleanup.delete_at, excluded.delete_at),"
+        " reminder_id = COALESCE(excluded.reminder_id, message_cleanup.reminder_id),"
+        " text = COALESCE(excluded.text, message_cleanup.text),"
+        " scheduled_for = COALESCE(excluded.scheduled_for, message_cleanup.scheduled_for)",
+        (scope, int(message_id), delete_text, reminder_id, text, scheduled_text),
+    )
+    conn.commit()
+
+
+def list_cleanup(conn):
+    return conn.execute("SELECT * FROM message_cleanup ORDER BY delete_at, id").fetchall()
+
+
+def due_cleanup(conn, now):
+    return conn.execute(
+        "SELECT * FROM message_cleanup WHERE delete_at <= ? ORDER BY delete_at, id",
+        (now.strftime(DATETIME_FMT),),
+    ).fetchall()
+
+
+def delete_cleanup(conn, cleanup_ids):
+    ids = tuple(cleanup_ids)
+    if not ids:
+        return
+    placeholders = ",".join("?" for _ in ids)
+    conn.execute(f"DELETE FROM message_cleanup WHERE id IN ({placeholders})", ids)
+    conn.commit()
+
+
+def defer_cleanup(conn, cleanup_ids, seconds=60):
+    ids = tuple(cleanup_ids)
+    if not ids:
+        return
+    placeholders = ",".join("?" for _ in ids)
+    when = (datetime.now() + timedelta(seconds=seconds)).strftime(DATETIME_FMT)
+    conn.execute(
+        f"UPDATE message_cleanup SET delete_at = ?, attempts = attempts + 1"
+        f" WHERE id IN ({placeholders})",
+        (when, *ids),
+    )
+    conn.commit()
+
+
+def queue_completed_cleanup(conn, sent, delete_at=None):
+    """Queue personal topic deliveries and its Saved Messages alert for deletion."""
+    if sent is None or sent["target"] != "me":
+        return
+    delete_at = delete_at or datetime.now()
+    if sent["pending_id"]:
+        rows = conn.execute(
+            "SELECT message_id FROM history WHERE status = 'sent' AND target = 'me'"
+            " AND pending_id = ? AND message_id IS NOT NULL",
+            (sent["pending_id"],),
+        ).fetchall()
+    else:
+        rows = [sent] if sent["message_id"] is not None else []
+    for row in rows:
+        queue_cleanup(conn, "control", row["message_id"], delete_at)
+    conn.execute(
+        "UPDATE message_cleanup SET delete_at = MIN(delete_at, ?)"
+        " WHERE scope = 'saved' AND reminder_id = ? AND scheduled_for = ?",
+        (delete_at.strftime(DATETIME_FMT), sent["reminder_id"], sent["scheduled_for"]),
+    )
+    conn.commit()

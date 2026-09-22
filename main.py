@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+from datetime import datetime, timedelta
 
 from telethon import TelegramClient, events
 
@@ -13,11 +14,18 @@ from config import (
     GROQ_MODEL, SEND_DELAY,
     SESSION_PATH,
 )
-from control import find_control_topic
+from control import PROBLEM_MESSAGE_SECONDS, find_control_topic, temporary_seconds
 from scheduler import cancel_legacy_scheduled, scheduler_loop
 
 
 log = logging.getLogger(__name__)
+STARTUP_MESSAGE_SECONDS = 60
+
+
+def _queue_control_cleanup(conn, messages, seconds):
+    delete_at = datetime.now() + timedelta(seconds=seconds)
+    for message in messages:
+        db.queue_cleanup(conn, "control", getattr(message, "id", message), delete_at)
 
 
 async def main():
@@ -43,24 +51,35 @@ async def main():
         async def on_command(event):
             if event.sender_id != me.id or not control.contains(event):
                 return
+            raw_text = event.raw_text or ""
+            if raw_text.startswith("\u2063"):
+                return
             try:
                 reply = event.message.reply_to
                 response = await commands.handle(
-                    event.raw_text or "", client, conn,
+                    raw_text, client, conn,
                     reply_to_msg_id=reply.reply_to_msg_id if reply else None,
                     interpreter=interpreter,
                     chat_id=event.chat_id,
                 )
                 if response:
-                    wake_event.set()
-                    await control.send(response)
+                    seconds = temporary_seconds(raw_text, response)
+                    sent = await control.send_all(response)
+                    _queue_control_cleanup(conn, [event.message, *sent], seconds)
+                else:
+                    _queue_control_cleanup(conn, [event.message], 30)
+                wake_event.set()
             except Exception as exc:
                 log.exception("Ошибка обработки команды")
                 try:
-                    await control.send(
+                    sent = await control.send_all(
                         f"Не удалось обработать команду ({type(exc).__name__}). "
                         "Повторите попытку или проверьте журнал приложения."
                     )
+                    _queue_control_cleanup(
+                        conn, [event.message, *sent], PROBLEM_MESSAGE_SECONDS,
+                    )
+                    wake_event.set()
                 except Exception:
                     log.exception("Не удалось сообщить об ошибке в тему")
 
@@ -82,7 +101,10 @@ async def main():
                 log.exception("Ошибка обработки ответа адресата")
                 db.add_notice(conn, "Ошибка обработки ответа адресата. Проверьте журнал приложения.")
 
-        await control.send("✅ Приложение запущено. Команды и личные напоминания работают в этой теме.")
+        startup = await control.send(
+            "✅ Приложение запущено. Команды и личные напоминания работают в этой теме."
+        )
+        _queue_control_cleanup(conn, [startup], STARTUP_MESSAGE_SECONDS)
         scheduler_task = asyncio.create_task(
             scheduler_loop(client, conn, wake_event, SEND_DELAY, control),
             name="reminder-scheduler",
@@ -98,10 +120,11 @@ async def main():
             except Exception as exc:
                 log.exception("Фоновая задача завершилась с ошибкой")
                 try:
-                    await control.send(
+                    warning = await control.send(
                         f"⚠️ Приложение перезапускается: {type(exc).__name__}. "
                         "Проверьте журнал, если сообщение повторяется."
                     )
+                    _queue_control_cleanup(conn, [warning], PROBLEM_MESSAGE_SECONDS)
                 except Exception:
                     log.exception("Не удалось сообщить о перезапуске")
                 raise

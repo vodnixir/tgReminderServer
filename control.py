@@ -1,6 +1,25 @@
 """Locate the private control topic and keep all app messages inside it."""
 
+import re
+
 from telethon import functions, utils
+
+
+SHORT_MESSAGE_SECONDS = 30
+REFERENCE_MESSAGE_SECONDS = 120
+PROBLEM_MESSAGE_SECONDS = 3600
+
+
+def temporary_seconds(raw_text, response):
+    """Choose how long command traffic should remain visible in the topic."""
+    response = response or ""
+    if response.startswith(("⚠️", "Не удалось")):
+        return PROBLEM_MESSAGE_SECONDS
+    command = re.sub(r"^/?\s*", "", (raw_text or "").casefold()).split(maxsplit=1)
+    if ((command and command[0] in {"помощь", "help", "список", "list", "история"})
+            or response.startswith(("Пишите команды", "Активные напоминания", "История"))):
+        return REFERENCE_MESSAGE_SECONDS
+    return SHORT_MESSAGE_SECONDS
 
 
 class ControlTopic:
@@ -19,12 +38,16 @@ class ControlTopic:
         return (reply.reply_to_top_id or reply.reply_to_msg_id) == self.topic_id
 
     async def send(self, text):
-        sent = None
+        sent = await self.send_all(text)
+        return sent[-1] if sent else None
+
+    async def send_all(self, text):
+        sent = []
         for start in range(0, len(text), 3900):
-            sent = await self.client.send_message(
+            sent.append(await self.client.send_message(
                 self.peer, "\u2063" + text[start:start + 3900], reply_to=self.topic_id,
                 parse_mode=None, link_preview=False,
-            )
+            ))
         return sent
 
 

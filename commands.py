@@ -353,6 +353,7 @@ def _done(conn, sent):
         return "Это напоминание уже отмечено выполненным."
     db.record_history(conn, sent["reminder_id"], sent["target"], sent["text"],
                       sent["scheduled_for"], "done", source_id=sent["id"])
+    db.queue_completed_cleanup(conn, sent)
     if sent["pending_id"]:
         db.close_pending(conn, sent["pending_id"])
     return f"✅ Отмечено выполнение #{sent['reminder_id']}."
@@ -412,8 +413,8 @@ async def _edit(conn, client, reminder_id, spec):
     row = db.get_reminder(conn, reminder_id)
     if row is None:
         return "Напоминание с таким номером не найдено. Проверьте «список»."
-    if row["scheduled_msg_id"]:
-        return "Сначала снимите старую запланированную отправку Telegram."
+    if not await _cancel_scheduled(conn, client, row):
+        return "Не удалось снять уведомление из планировщика Telegram. Повторите позже."
     if len(spec.text) > 3800:
         return "Текст напоминания слишком длинный."
     if spec.target != "me":
@@ -472,6 +473,18 @@ def _set_confirmation(conn, reminder_id, required):
     return f"Подтверждение для #{reminder_id} {'включено' if required else 'выключено'}."
 
 
+async def _cancel_scheduled(conn, client, row):
+    if not row["scheduled_msg_id"]:
+        return True
+    try:
+        peer = await client.get_input_entity(row["target"])
+        await client(DeleteScheduledMessagesRequest(peer, id=[row["scheduled_msg_id"]]))
+    except Exception:
+        return False
+    db.clear_scheduled_msg_id(conn, row["id"])
+    return True
+
+
 async def _delete(conn, client, reminder_id):
     row = db.get_reminder(conn, reminder_id)
     if row is None:
@@ -480,12 +493,8 @@ async def _delete(conn, client, reminder_id):
             return "Напоминание с таким номером не найдено. Проверьте «список»."
         db.close_pending(conn, pending["id"])
         return f"Ожидание подтверждения #{reminder_id} удалено."
-    if row["scheduled_msg_id"]:
-        try:
-            peer = await client.get_input_entity(row["target"])
-            await client(DeleteScheduledMessagesRequest(peer, id=[row["scheduled_msg_id"]]))
-        except Exception:
-            return "Не удалось снять старую запланированную отправку в Telegram. Повторите удаление позже."
+    if not await _cancel_scheduled(conn, client, row):
+        return "Не удалось снять уведомление из планировщика Telegram. Повторите удаление позже."
     db.delete_reminder(conn, reminder_id)
     db.close_pending_for_reminder(conn, reminder_id)
     return f"Напоминание #{reminder_id} удалено."
@@ -539,8 +548,8 @@ async def _apply_ai(action, client, conn, reply_to_msg_id, raw_text, chat_id=Non
         row = db.get_reminder(conn, rid) if rid else None
         if row is None:
             return "Укажите номер существующего напоминания."
-        if row["scheduled_msg_id"]:
-            return "Сначала снимите старую запланированную отправку Telegram."
+        if not await _cancel_scheduled(conn, client, row):
+            return "Не удалось снять уведомление из планировщика Telegram. Повторите позже."
         db.set_paused(conn, rid, kind == "pause")
         db.record_history(conn, rid, row["target"], row["text"], row["next_run"],
                           "paused" if kind == "pause" else "resumed")
@@ -643,8 +652,8 @@ async def handle(raw_text, client, conn, reply_to_msg_id=None, interpreter=None,
             if interpreter is None or rid is not None:
                 return "Укажите номер существующего напоминания из «список»."
         else:
-            if row["scheduled_msg_id"]:
-                return "Сначала снимите старую запланированную отправку Telegram."
+            if not await _cancel_scheduled(conn, client, row):
+                return "Не удалось снять уведомление из планировщика Telegram. Повторите позже."
             db.set_paused(conn, rid, command == "пауза")
             db.record_history(conn, rid, row["target"], row["text"], row["next_run"],
                               "paused" if command == "пауза" else "resumed")

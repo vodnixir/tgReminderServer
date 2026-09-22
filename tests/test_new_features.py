@@ -101,16 +101,27 @@ class HistoryTests(unittest.TestCase):
 
 
 class ReplyTests(unittest.IsolatedAsyncioTestCase):
-    async def test_pause_rejects_uncancelled_telegram_schedule(self):
+    async def test_pause_cancels_telegram_notification(self):
         conn = db.connect(":memory:")
         try:
             rid = db.add_reminder(conn, "me", "Вода", datetime.now() + timedelta(hours=1),
                                   None, 1)
             conn.execute("UPDATE reminders SET scheduled_msg_id = 9 WHERE id = ?", (rid,))
             conn.commit()
-            response = await handle(f"пауза {rid}", None, conn)
-            self.assertIn("запланирован", response)
-            self.assertEqual(db.get_reminder(conn, rid)["paused"], 0)
+
+            class Client:
+                async def get_input_entity(self, target):
+                    return target
+
+                async def __call__(self, request):
+                    self.request = request
+
+            client = Client()
+            response = await handle(f"пауза {rid}", client, conn)
+            self.assertIn("пауза", response)
+            self.assertEqual(client.request.id, [9])
+            self.assertEqual(db.get_reminder(conn, rid)["paused"], 1)
+            self.assertIsNone(db.get_reminder(conn, rid)["scheduled_msg_id"])
         finally:
             conn.close()
 
